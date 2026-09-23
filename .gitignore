@@ -1,0 +1,15 @@
+.env
+.env.local
+.env*.local
+.next/
+node_modules/
+data/
+/desktop.png
+/mobile.png
+/desktop-map.png
+/mobile-map.png
+/weather-effects.png
+/vercel-next.png
+__pycache__/
+*.pyc
+npm-debug.log*
