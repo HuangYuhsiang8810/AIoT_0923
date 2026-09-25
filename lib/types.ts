@@ -31,6 +31,35 @@ export type WeatherRow = {
   syncedAt: string;
 };
 
+export type WindGridRecord = {
+  header: {
+    parameterCategory: 2;
+    parameterNumber: 2 | 3;
+    nx: number;
+    ny: number;
+    lo1: number;
+    lo2: number;
+    la1: number;
+    la2: number;
+    dx: number;
+    dy: number;
+    refTime: string;
+    forecastTime: 0;
+  };
+  data: number[];
+};
+
+export type WindResponse = {
+  records: [WindGridRecord, WindGridRecord];
+  observedAt: string;
+  checkedAt: string;
+  pointCount: number;
+  maxSpeed: number;
+  source: 'ECMWF IFS HRES 9 km';
+  sampleStep: number;
+  stale?: boolean;
+};
+
 export type StatusResponse = {
   database: {
     provider: 'neon' | 'memory';

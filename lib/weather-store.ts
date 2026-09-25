@@ -1,4 +1,5 @@
 import { neon } from '@neondatabase/serverless';
+import { randomUUID } from 'node:crypto';
 import { fetchCwaRows, DEFAULT_DATASET_ID } from '@/lib/cwa';
 import type { StatusResponse, WeatherLocation, WeatherResponse, WeatherRow } from '@/lib/types';
 
@@ -6,10 +7,25 @@ const ELEMENT_LABELS: Record<string, string> = {
   Wx: '天氣現象', PoP: '降雨機率', MinT: '最低溫', MaxT: '最高溫', CI: '舒適度',
 };
 const STALE_AFTER_MS = 3 * 60 * 60 * 1000;
-const RESYNC_GUARD_MS = 5 * 60 * 1000;
+const SYNC_LEASE_MS = 90 * 1000;
+const SYNC_WAIT_MS = 35 * 1000;
+const SYNC_POLL_MS = 500;
 
 type MemoryCache = { rows: WeatherRow[]; lastError: string | null };
-const runtime = globalThis as typeof globalThis & { __cwaMemory?: MemoryCache; __cwaSchema?: Promise<void> };
+type SyncResult = {
+  success: true;
+  recordCount: number;
+  syncedAt: string | null;
+  skipped?: true;
+  reason?: 'fresh' | 'in-flight';
+  storage?: 'memory' | 'neon';
+};
+
+const runtime = globalThis as typeof globalThis & {
+  __cwaMemory?: MemoryCache;
+  __cwaSchema?: Promise<void>;
+  __cwaSync?: Promise<SyncResult>;
+};
 runtime.__cwaMemory ||= { rows: [], lastError: null };
 
 function sqlClient() {
@@ -29,7 +45,9 @@ async function ensureSchema(): Promise<void> {
         status TEXT NOT NULL CHECK (status IN ('running', 'success', 'failed')),
         record_count INTEGER NOT NULL DEFAULT 0,
         error_message TEXT
-      );
+      )
+    `);
+    await sql.query(`
       CREATE TABLE IF NOT EXISTS weather_forecasts (
         id BIGSERIAL PRIMARY KEY,
         dataset_id TEXT NOT NULL,
@@ -41,40 +59,130 @@ async function ensureSchema(): Promise<void> {
         unit TEXT,
         synced_at TIMESTAMPTZ NOT NULL,
         UNIQUE(dataset_id, location_name, element_name, start_time, end_time)
-      );
-      CREATE INDEX IF NOT EXISTS idx_forecast_location_time
-        ON weather_forecasts(location_name, start_time);
+      )
     `);
-  })();
+    await sql.query(`
+      CREATE INDEX IF NOT EXISTS idx_forecast_location_time
+        ON weather_forecasts(location_name, start_time)
+    `);
+    await sql.query(`
+      CREATE TABLE IF NOT EXISTS weather_sync_leases (
+        dataset_id TEXT PRIMARY KEY,
+        token TEXT NOT NULL,
+        lease_until TIMESTAMPTZ NOT NULL
+      )
+    `);
+  })().catch((error) => {
+    runtime.__cwaSchema = undefined;
+    throw error;
+  });
   return runtime.__cwaSchema;
 }
 
 function newestTimestamp(rows: WeatherRow[]): number {
-  return rows.length ? new Date(rows[0].syncedAt).getTime() : 0;
+  return rows.reduce((latest, row) => Math.max(latest, new Date(row.syncedAt).getTime() || 0), 0);
 }
 
-export async function syncWeather(force = false) {
-  const existing = await readRows(false);
-  if (!force && Date.now() - newestTimestamp(existing) < RESYNC_GUARD_MS) {
-    return { success: true, recordCount: existing.length, syncedAt: existing[0]?.syncedAt ?? null, skipped: true };
-  }
+function needsRefresh(rows: WeatherRow[]): boolean {
+  const newest = newestTimestamp(rows);
+  return newest === 0 || Date.now() - newest >= STALE_AFTER_MS;
+}
 
-  const rows = await fetchCwaRows();
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function readStoredRows(): Promise<WeatherRow[]> {
   const sql = sqlClient();
-  if (!sql) {
-    runtime.__cwaMemory = { rows, lastError: null };
-    return { success: true, recordCount: rows.length, syncedAt: rows[0].syncedAt, storage: 'memory' as const };
-  }
+  if (!sql) return runtime.__cwaMemory?.rows ?? [];
 
   await ensureSchema();
-  const datasetId = rows[0].datasetId;
-  const startedAt = new Date().toISOString();
-  const run = await sql.query(
-    `INSERT INTO sync_runs(dataset_id, started_at, status) VALUES ($1, $2, 'running') RETURNING id`,
-    [datasetId, startedAt],
-  ) as { id: string }[];
-  const runId = run[0].id;
+  const result = await sql.query(`
+    SELECT dataset_id AS "datasetId", location_name AS "locationName", element_name AS "elementName",
+           start_time AS "startTime", end_time AS "endTime", value, unit, synced_at AS "syncedAt"
+    FROM weather_forecasts
+    WHERE dataset_id = $1
+      AND synced_at = (SELECT MAX(synced_at) FROM weather_forecasts WHERE dataset_id = $1)
+    ORDER BY location_name, start_time, element_name
+  `, [process.env.CWA_DATASET_ID || DEFAULT_DATASET_ID]) as WeatherRow[];
+  return result.map((row) => ({ ...row, syncedAt: new Date(row.syncedAt).toISOString() }));
+}
+
+async function acquireSyncLease(datasetId: string, token: string): Promise<boolean> {
+  const sql = sqlClient();
+  if (!sql) return true;
+  const result = await sql.query(`
+    INSERT INTO weather_sync_leases(dataset_id, token, lease_until)
+    VALUES ($1, $2, NOW() + ($3 * INTERVAL '1 millisecond'))
+    ON CONFLICT(dataset_id) DO UPDATE
+      SET token = EXCLUDED.token, lease_until = EXCLUDED.lease_until
+      WHERE weather_sync_leases.lease_until < NOW()
+    RETURNING token
+  `, [datasetId, token, SYNC_LEASE_MS]) as { token: string }[];
+  return result[0]?.token === token;
+}
+
+async function releaseSyncLease(datasetId: string, token: string): Promise<void> {
+  const sql = sqlClient();
+  if (!sql) return;
+  await sql.query(`DELETE FROM weather_sync_leases WHERE dataset_id = $1 AND token = $2`, [datasetId, token]);
+}
+
+async function waitForConcurrentSync(previousTimestamp: number): Promise<WeatherRow[]> {
+  const deadline = Date.now() + SYNC_WAIT_MS;
+  while (Date.now() < deadline) {
+    await delay(SYNC_POLL_MS);
+    const rows = await readStoredRows();
+    if (newestTimestamp(rows) > previousTimestamp) return rows;
+  }
+  return readStoredRows();
+}
+
+async function performSync(force: boolean): Promise<SyncResult> {
+  const existing = await readStoredRows();
+  if (!force && !needsRefresh(existing)) {
+    return {
+      success: true,
+      recordCount: existing.length,
+      syncedAt: existing[0]?.syncedAt ?? null,
+      skipped: true,
+      reason: 'fresh',
+    };
+  }
+
+  const datasetId = process.env.CWA_DATASET_ID || DEFAULT_DATASET_ID;
+  const token = randomUUID();
+  if (!(await acquireSyncLease(datasetId, token))) {
+    const rows = await waitForConcurrentSync(newestTimestamp(existing));
+    if (rows.length) {
+      return {
+        success: true,
+        recordCount: rows.length,
+        syncedAt: rows[0]?.syncedAt ?? null,
+        skipped: true,
+        reason: 'in-flight',
+      };
+    }
+    throw new Error('天氣資料正在由另一個請求更新，請稍後再試');
+  }
+
+  const sql = sqlClient();
+  let runId: string | null = null;
   try {
+    if (sql) {
+      const run = await sql.query(
+        `INSERT INTO sync_runs(dataset_id, started_at, status) VALUES ($1, NOW(), 'running') RETURNING id`,
+        [datasetId],
+      ) as { id: string }[];
+      runId = run[0].id;
+    }
+
+    const rows = await fetchCwaRows();
+    if (!sql) {
+      runtime.__cwaMemory = { rows, lastError: null };
+      return { success: true, recordCount: rows.length, syncedAt: rows[0].syncedAt, storage: 'memory' };
+    }
+
     await sql.query(`
       INSERT INTO weather_forecasts(
         dataset_id, location_name, element_name, start_time, end_time, value, unit, synced_at
@@ -95,42 +203,39 @@ export async function syncWeather(force = false) {
       `UPDATE sync_runs SET completed_at = $1, status = 'success', record_count = $2 WHERE id = $3`,
       [rows[0].syncedAt, rows.length, runId],
     );
-    return { success: true, recordCount: rows.length, syncedAt: rows[0].syncedAt, storage: 'neon' as const };
+    return { success: true, recordCount: rows.length, syncedAt: rows[0].syncedAt, storage: 'neon' };
   } catch (error) {
-    await sql.query(
-      `UPDATE sync_runs SET completed_at = NOW(), status = 'failed', error_message = $1 WHERE id = $2`,
-      [error instanceof Error ? error.message : String(error), runId],
-    );
+    if (sql && runId) {
+      await sql.query(
+        `UPDATE sync_runs SET completed_at = NOW(), status = 'failed', error_message = $1 WHERE id = $2`,
+        [error instanceof Error ? error.message : String(error), runId],
+      );
+    }
     throw error;
+  } finally {
+    await releaseSyncLease(datasetId, token).catch(() => undefined);
   }
 }
 
-async function readRows(refreshWhenStale = true): Promise<WeatherRow[]> {
-  const sql = sqlClient();
-  let rows: WeatherRow[];
-  if (!sql) {
-    rows = runtime.__cwaMemory?.rows ?? [];
-  } else {
-    await ensureSchema();
-    const result = await sql.query(`
-      SELECT dataset_id AS "datasetId", location_name AS "locationName", element_name AS "elementName",
-             start_time AS "startTime", end_time AS "endTime", value, unit, synced_at AS "syncedAt"
-      FROM weather_forecasts
-      WHERE dataset_id = $1
-        AND synced_at = (SELECT MAX(synced_at) FROM weather_forecasts WHERE dataset_id = $1)
-      ORDER BY location_name, start_time, element_name
-    `, [process.env.CWA_DATASET_ID || DEFAULT_DATASET_ID]) as WeatherRow[];
-    rows = result.map((row) => ({ ...row, syncedAt: new Date(row.syncedAt).toISOString() }));
-  }
+export function syncWeather(force = false): Promise<SyncResult> {
+  if (runtime.__cwaSync) return runtime.__cwaSync;
+  const promise = performSync(force).finally(() => {
+    if (runtime.__cwaSync === promise) runtime.__cwaSync = undefined;
+  });
+  runtime.__cwaSync = promise;
+  return promise;
+}
 
-  if (refreshWhenStale && process.env.CWA_API_KEY && Date.now() - newestTimestamp(rows) > STALE_AFTER_MS) {
-    try {
-      await syncWeather(true);
-      return readRows(false);
-    } catch (error) {
-      if (!rows.length) throw error;
-      runtime.__cwaMemory!.lastError = error instanceof Error ? error.message : String(error);
-    }
+async function readRows(refreshWhenStale = true): Promise<WeatherRow[]> {
+  let rows = await readStoredRows();
+  if (!refreshWhenStale || !process.env.CWA_API_KEY || !needsRefresh(rows)) return rows;
+
+  try {
+    await syncWeather(false);
+    rows = await readStoredRows();
+  } catch (error) {
+    if (!rows.length) throw error;
+    runtime.__cwaMemory!.lastError = error instanceof Error ? error.message : String(error);
   }
   return rows;
 }

@@ -3,8 +3,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { tsParticles } from '@tsparticles/engine';
 import { loadSlim } from '@tsparticles/slim';
-import type { CircleMarker, Map as LeafletMap, Marker, TileLayer } from 'leaflet';
-import type { StatusResponse, WeatherLocation, WeatherPeriod, WeatherResponse } from '@/lib/types';
+import type { CircleMarker, Layer as LeafletLayer, Map as LeafletMap, Marker, TileLayer } from 'leaflet';
+import type { StatusResponse, WeatherLocation, WeatherPeriod, WeatherResponse, WindResponse } from '@/lib/types';
 
 const CITY_COORDS: Record<string, [number, number]> = {
   基隆市: [25.1283, 121.7419], 臺北市: [25.0375, 121.5637], 新北市: [25.012, 121.4657],
@@ -17,7 +17,7 @@ const CITY_COORDS: Record<string, [number, number]> = {
   連江縣: [26.1605, 119.9517],
 };
 
-type LayerName = 'temperature' | 'rain' | 'weather' | 'comfort';
+type LayerName = 'temperature' | 'rain' | 'weather' | 'comfort' | 'wind';
 type WeatherMood = 'sunny' | 'cloudy' | 'rain' | 'storm';
 type Destroyable = { destroy: () => void };
 
@@ -158,11 +158,14 @@ export default function WeatherConsole({ initialWeather, initialStatus, initialE
   const [selectedWeather, setSelectedWeather] = useState<string | null>(null);
   const [notice, setNotice] = useState(initialError);
   const [syncing, setSyncing] = useState(false);
+  const [windLoading, setWindLoading] = useState(false);
+  const [windInfo, setWindInfo] = useState<Pick<WindResponse, 'observedAt' | 'checkedAt' | 'pointCount' | 'maxSpeed' | 'source' | 'sampleStep' | 'stale'> | null>(null);
   const [mapReady, setMapReady] = useState(false);
   const mapHostRef = useRef<HTMLDivElement>(null);
   const mapRef = useRef<LeafletMap | null>(null);
   const tileRef = useRef<TileLayer | null>(null);
   const markersRef = useRef<Marker[]>([]);
+  const windLayerRef = useRef<LeafletLayer | null>(null);
   const userMarkerRef = useRef<CircleMarker | null>(null);
   const effectRef = useRef<Destroyable | null>(null);
   const particlesReadyRef = useRef<Promise<void> | null>(null);
@@ -190,7 +193,7 @@ export default function WeatherConsole({ initialWeather, initialStatus, initialE
     let cancelled = false;
     void import('leaflet').then((L) => {
       if (cancelled || !mapHostRef.current) return;
-      const map = L.map(mapHostRef.current, { zoomControl: true, zoomSnap: 0.25, minZoom: 6, maxZoom: 13 }).setView([23.75, 120.85], 8);
+      const map = L.map(mapHostRef.current, { zoomControl: true, zoomSnap: 0.25, minZoom: 3, maxZoom: 13 }).setView([23.75, 120.85], 8);
       const tile = L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
         attribution: '&copy; OpenStreetMap contributors', maxZoom: 19,
       }).addTo(map);
@@ -215,11 +218,19 @@ export default function WeatherConsole({ initialWeather, initialStatus, initialE
   }, [labelsEnabled]);
 
   useEffect(() => {
+    document.body.dataset.layer = layer;
+    if (!mapRef.current || !mapReady) return;
+    mapRef.current.setView(layer === 'wind' ? [23.5, 123] : [23.75, 120.85], layer === 'wind' ? 5 : 8);
+  }, [layer, mapReady]);
+
+  useEffect(() => {
     if (!mapRef.current || !mapReady) return;
     let cancelled = false;
     void import('leaflet').then((L) => {
       if (cancelled || !mapRef.current) return;
       markersRef.current.forEach((marker) => marker.remove());
+      markersRef.current = [];
+      if (layer === 'wind') return;
       markersRef.current = locations.flatMap((location) => {
         const coords = CITY_COORDS[location.locationName];
         if (!coords || !mapRef.current) return [];
@@ -240,6 +251,62 @@ export default function WeatherConsole({ initialWeather, initialStatus, initialE
     });
     return () => { cancelled = true; };
   }, [locations, periodIndex, layer, mapReady]);
+
+  useEffect(() => {
+    const map = mapRef.current;
+    windLayerRef.current?.remove();
+    windLayerRef.current = null;
+    if (!map || !mapReady || layer !== 'wind') return;
+
+    const controller = new AbortController();
+    let cancelled = false;
+    setWindLoading(true);
+    void Promise.all([
+      import('leaflet-wind'),
+      fetch('/api/wind', { cache: 'no-store', signal: controller.signal }).then(async (response) => {
+        const payload = await response.json() as WindResponse & { error?: string };
+        if (!response.ok) throw new Error(payload.error || '風場資料讀取失敗');
+        return payload;
+      }),
+    ]).then(([{ WindLayer }, payload]) => {
+      if (cancelled) return;
+      const reduceMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+      const windLayer = new WindLayer('taiwan-wind', payload.records, {
+        zIndex: 360,
+        windOptions: {
+          colorScale: ['#8de7ff', '#6ce0ce', '#83e46e', '#e9e866', '#ffc857', '#ff8d4b', '#ff5370'],
+          velocityScale: () => Math.min(0.055, 0.009 * Math.pow(1.45, Math.max(0, map.getZoom() - 6))),
+          paths: reduceMotion ? 450 : 2600,
+          maxAge: reduceMotion ? 22 : 70,
+          frameRate: reduceMotion ? 5 : 22,
+          globalAlpha: 0.82,
+          lineWidth: 1.25,
+        },
+      });
+      windLayer.addTo(map);
+      windLayerRef.current = windLayer;
+      setWindInfo({
+        observedAt: payload.observedAt,
+        checkedAt: payload.checkedAt,
+        pointCount: payload.pointCount,
+        maxSpeed: payload.maxSpeed,
+        source: payload.source,
+        sampleStep: payload.sampleStep,
+        stale: payload.stale,
+      });
+    }).catch((error: Error) => {
+      if (!cancelled && error.name !== 'AbortError') setNotice(error.message);
+    }).finally(() => {
+      if (!cancelled) setWindLoading(false);
+    });
+
+    return () => {
+      cancelled = true;
+      controller.abort();
+      windLayerRef.current?.remove();
+      windLayerRef.current = null;
+    };
+  }, [layer, mapReady]);
 
   const rows = useMemo(() => locations.map((location) => ({
     location, period: location.periods[periodIndex] || location.periods[0],
@@ -263,7 +330,7 @@ export default function WeatherConsole({ initialWeather, initialStatus, initialE
   useEffect(() => {
     const mood = weatherMood(activeWeather);
     document.body.dataset.weather = mood;
-    if (!effectsEnabled || !activeWeather) {
+    if (!effectsEnabled || !activeWeather || layer === 'wind') {
       effectRef.current?.destroy();
       effectRef.current = null;
       return;
@@ -282,7 +349,7 @@ export default function WeatherConsole({ initialWeather, initialStatus, initialE
       effectRef.current?.destroy();
       effectRef.current = null;
     };
-  }, [activeWeather, effectsEnabled]);
+  }, [activeWeather, effectsEnabled, layer]);
 
   const periods = locations[0]?.periods || [];
   const legend = {
@@ -290,6 +357,7 @@ export default function WeatherConsole({ initialWeather, initialStatus, initialE
     rain: { unit: '%', values: ['0', '20', '40', '60', '100'], gradient: 'linear-gradient(90deg,#b8dbe0,#80cce4,#4da9df,#567dd6,#9b6fd0)' },
     weather: { unit: '天氣', values: ['晴', '多雲', '陰', '雨'], gradient: 'linear-gradient(90deg,#ffd36f,#dce2cf,#9ba8b7,#5f78a7)' },
     comfort: { unit: '體感', values: ['寒冷', '舒適', '稍熱', '悶熱'], gradient: 'linear-gradient(90deg,#7fcbe1,#c9eaaa,#ffd178,#ffa06b)' },
+    wind: { unit: 'm/s', values: ['0', '3', '7', '12', '20+'], gradient: 'linear-gradient(90deg,#8de7ff,#6ce0ce,#83e46e,#e9e866,#ffc857,#ff8d4b,#ff5370)' },
   }[layer];
 
   async function syncNow() {
@@ -327,12 +395,12 @@ export default function WeatherConsole({ initialWeather, initialStatus, initialE
     <div id="weather-effects" className={effectsEnabled ? '' : 'hidden'} aria-hidden="true" />
 
     <section className="summary-panel glass-panel" aria-labelledby="summary-title">
-      <div className="panel-heading"><div><p className="panel-kicker">CWA OPEN DATA</p><h1 id="summary-title">台灣縣市預報</h1></div><span className="source-badge">{status?.database.provider === 'neon' ? 'Neon DB' : '開發模式'}</span></div>
+      <div className="panel-heading"><div><p className="panel-kicker">{layer === 'wind' ? 'NUMERICAL WEATHER MODEL' : 'CWA OPEN DATA'}</p><h1 id="summary-title">{layer === 'wind' ? '東亞即時風場' : '台灣縣市預報'}</h1></div><span className="source-badge">{layer === 'wind' ? windInfo?.stale ? 'STALE WIND' : 'LIVE WIND' : status?.database.provider === 'neon' ? 'Neon DB' : '開發模式'}</span></div>
       <dl className="dataset-meta">
-        <div><dt>預報起始</dt><dd>{formatTime(dashboard?.firstPeriod.startTime, true)}</dd></div>
-        <div><dt>資料來源</dt><dd>CWA F-C0032-001</dd></div>
-        <div><dt>本次讀取</dt><dd>{status?.lastRun?.status === 'success' ? `成功（${status.database.rowCount} 筆）` : '資料讀取中'}</dd></div>
-        <div><dt>儲存架構</dt><dd>{status?.database.provider === 'neon' ? 'Vercel + Neon Postgres' : '本機記憶體'}</dd></div>
+        <div><dt>{layer === 'wind' ? '模式有效時間' : '預報起始'}</dt><dd>{formatTime(layer === 'wind' ? windInfo?.observedAt : dashboard?.firstPeriod.startTime, true)}</dd></div>
+        <div><dt>資料來源</dt><dd>{layer === 'wind' ? <a href="https://open-meteo.com/" target="_blank" rel="noreferrer">ECMWF IFS 9 km / Open-Meteo</a> : 'CWA F-C0032-001'}</dd></div>
+        <div><dt>{layer === 'wind' ? '區域取樣網格' : '本次讀取'}</dt><dd>{layer === 'wind' ? windLoading ? '風場更新中…' : `${windInfo?.pointCount ?? 0} 點（${windInfo?.sampleStep ?? '—'}°）` : status?.lastRun?.status === 'success' ? `成功（${status.database.rowCount} 筆）` : '資料讀取中'}</dd></div>
+        <div><dt>{layer === 'wind' ? '區域最大風速' : '儲存架構'}</dt><dd>{layer === 'wind' ? `${windInfo?.maxSpeed ?? '—'} m/s` : status?.database.provider === 'neon' ? 'Vercel + Neon Postgres' : '本機記憶體'}</dd></div>
       </dl>
       <div className="metric-grid">
         <article><span>最高溫</span><strong>{elementValue(dashboard?.highest.period, 'MaxT')}<small> °C</small></strong><small>{dashboard?.highest.location.locationName || '—'}</small></article>
@@ -347,7 +415,7 @@ export default function WeatherConsole({ initialWeather, initialStatus, initialE
     <aside className="layer-panel glass-panel" aria-labelledby="layer-title">
       <p className="panel-kicker" id="layer-title">圖層</p>
       <div className="layer-list" role="radiogroup" aria-label="資料圖層">
-        {([['temperature', '🌡️', '氣溫'], ['rain', '🌧️', '降雨機率'], ['weather', '🌤️', '天氣'], ['comfort', '💧', '舒適度']] as const).map(([value, icon, label]) => <button key={value} className={`layer-button ${layer === value ? 'active' : ''}`} onClick={() => setLayer(value)} role="radio" aria-checked={layer === value}><span>{icon}</span>{label}</button>)}
+        {([['temperature', '🌡️', '氣溫'], ['rain', '🌧️', '降雨機率'], ['weather', '🌤️', '天氣'], ['comfort', '💧', '舒適度'], ['wind', '≋', '動態風場']] as const).map(([value, icon, label]) => <button key={value} className={`layer-button ${layer === value ? 'active' : ''}`} onClick={() => setLayer(value)} role="radio" aria-checked={layer === value}><span>{icon}</span>{label}</button>)}
       </div>
       <div className="toggle-list">
         <label><input type="checkbox" checked={labelsEnabled} onChange={(event) => setLabelsEnabled(event.target.checked)} /><span>縣市數值標籤</span></label>
@@ -359,7 +427,7 @@ export default function WeatherConsole({ initialWeather, initialStatus, initialE
     </aside>
 
     <section className="legend glass-panel" aria-label="圖例"><strong>{legend.unit}</strong><div><span className="legend-gradient" style={{ background: legend.gradient }} /><div id="legend-values">{legend.values.map((value) => <small key={value}>{value}</small>)}</div></div></section>
-    <section className="status-bar glass-panel" aria-live="polite"><span>更新於 <strong>{formatTime(status?.database.syncedAt, true)}</strong></span><button onClick={syncNow} disabled={syncing}>{syncing ? '同步中…' : '↻ 更新整理'}</button></section>
+    <section className="status-bar glass-panel" aria-live="polite"><span>{layer === 'wind' ? '最近檢查於' : '更新於'} <strong>{formatTime(layer === 'wind' ? windInfo?.checkedAt : status?.database.syncedAt, true)}</strong></span>{layer === 'wind' ? <em>{windLoading ? '下載並驗證模式風場中…' : windInfo?.stale ? '上游暫時失敗，顯示上一版有效資料' : '每 3 小時檢查，粒子依風向流動'}</em> : <button onClick={syncNow} disabled={syncing}>{syncing ? '同步中…' : '↻ 更新整理'}</button>}</section>
     {notice && <div className="notice" role="status" onClick={() => setNotice('')}>{notice}</div>}
   </main>;
 }

@@ -31,6 +31,7 @@
 | GIS 底圖 | 已完成 | Leaflet 顯示 OpenStreetMap raster tiles |
 | 氣象圖層 | 已完成 | 氣溫、降雨機率、天氣現象、舒適度 |
 | 動態天氣效果 | 已完成 | tsParticles 依晴、陰、雨、雷雨切換效果 |
+| 東亞動態風場 | 已完成 | ECMWF IFS HRES 9 km，伺服器每 3 小時檢查並原子更新 |
 | GitHub | 已連線 | `main` 分支作為正式版本來源 |
 | Vercel Production 環境變數 | 部分完成 | `CWA_API_KEY`、`CWA_DATASET_ID` 已設定 |
 | Neon PostgreSQL | 待連接 | 未設定 `DATABASE_URL` 時使用記憶體暫存，不適合正式持久化 |
@@ -100,14 +101,29 @@ CWA API 需要會員授權碼；取得與呼叫方式請參考[中央氣象署�
 
 目前的縣市座標是應用程式維護的代表點，不是行政區邊界資料。若要製作正式縣市色塊圖（Choropleth），應再導入政府公開的行政區 GeoJSON，使用縣市代碼或標準化縣市名稱進行 Join，不應以模糊文字比對。
 
+### 3.4 東亞數值模式風場
+
+- 原始模式：ECMWF IFS HRES，原生空間解析度 9 km、每 6 小時更新
+- API 服務：[Open-Meteo ECMWF API](https://open-meteo.com/en/docs/ecmwf-api)
+- 顯示範圍：東經 105°–141°、北緯 14°–33°
+- 顯示取樣：1° 規則網格；粒子圖層會在網格之間插值
+- 更新策略：最後檢查超過 3 小時，下一個風場請求會重新取得資料
+- 正確性策略：完整驗證所有時間、風速、風向與點數後，才以單一 DB upsert 替換有效版本
+- 失敗策略：上游失敗不會覆蓋 DB；暫時顯示上一版並標示 `STALE WIND`，10 分鐘後再嘗試
+
+風場是數值模式的目前有效時間切片，不是測站即時觀測。正式環境設定 `DATABASE_URL` 後會自動建立 `wind_fields` 與 `wind_sync_leases`，讓多個 Serverless instance 共用同一份有效資料並避免同時重抓。
+
 ## 4. 系統架構
+
+完整的五層架構、使用者進站更新流程、GitHub/Vercel 發布流程與各層操作，請見 [`docs/architecture.md`](docs/architecture.md)。下圖為核心資料流摘要：
 
 ```mermaid
 flowchart LR
-    CWA[CWA Open Data API] -->|HTTPS JSON| FETCH[Next.js Data Fetcher]
+    CWA[CWA Open Data API] -->|JSON| FETCH[Next.js Data Fetchers]
+    ECMWF[ECMWF IFS / Open-Meteo] -->|10 m wind| FETCH
     FETCH --> VALIDATE[Schema / 欄位 / 時間驗證]
-    VALIDATE --> NORMALIZE[正規化 WeatherRow]
-    NORMALIZE --> UPSERT[Upsert + 同步紀錄]
+    VALIDATE --> NORMALIZE[WeatherRow / U-V Grid]
+    NORMALIZE --> UPSERT[驗證成功後原子 Upsert]
     UPSERT --> DB[(Neon PostgreSQL)]
 
     DB --> API[Next.js Route Handlers]
@@ -116,12 +132,10 @@ flowchart LR
     UI --> MAP
     MAP --> USER[Browser]
 
-    CRON[Vercel Cron] -->|Bearer CRON_SECRET| SYNC[/api/cron]
+    CRON[Vercel Cron / 讀取時更新] --> SYNC[3 小時過期檢查 + DB Lease]
     SYNC --> FETCH
-    USER -->|手動更新| MANUAL[/api/sync]
-    MANUAL --> FETCH
 
-    GITHUB[GitHub main] --> VERCEL[Vercel Build & Deploy]
+    GITHUB[GitHub main<br/>只保存程式與設定] --> VERCEL[Vercel Build & Deploy]
     VERCEL --> API
     VERCEL --> UI
 ```
@@ -130,15 +144,15 @@ flowchart LR
 
 | 層級 | 元件 | 責任 |
 | --- | --- | --- |
-| 外部資料 | CWA API | 提供官方預報或觀測 JSON |
-| 資料擷取 | `lib/cwa.ts` | 組合 API URL、驗證授權、設定 timeout、解析 CWA 回傳 |
-| 資料服務 | `lib/weather-store.ts` | 同步、去重、Upsert、過期判定、查詢與 API response 組裝 |
-| 資料庫 | Neon PostgreSQL | 保存最新預報快照與同步結果 |
+| 外部資料 | CWA API、ECMWF/Open-Meteo | 提供官方預報 JSON 與數值模式風場 |
+| 資料擷取 | `lib/cwa.ts`、`lib/model-wind.ts` | timeout、來源驗證、正規化、風向轉 U/V 與完整性檢查 |
+| 資料服務 | `lib/weather-store.ts`、`lib/model-wind.ts` | 三小時過期判定、同步租約、失敗保底與 API response 組裝 |
+| 資料庫 | Neon PostgreSQL | 保存最新預報、風場快照、同步結果與更新租約 |
 | Backend API | `app/api/*` | 對前端、手動同步與 Vercel Cron 提供介面 |
 | SSR 頁面 | `app/page.tsx` | 首次請求於伺服器端載入資料，避免空白首屏 |
 | 前端 | `components/WeatherConsole.tsx` | 地圖、圖層、時段、Popup、定位與動態效果 |
-| GIS | Leaflet + OSM | 底圖顯示、Marker、Popup 與地圖互動 |
-| 部署 | GitHub + Vercel | 版本控制、Preview、Production build 與 Serverless Functions |
+| GIS | Leaflet + leaflet-wind + OSM | 底圖、Marker、Popup、東亞 U/V 粒子風場與互動 |
+| 版本與部署 | GitHub + Vercel | GitHub 保存程式與文件；Vercel build、CDN 與 Serverless Functions |
 
 ## 5. 資料處理流程
 
@@ -334,6 +348,7 @@ components/
 └─ WeatherConsole.tsx        # Leaflet、圖層、Popup、tsParticles
 lib/
 ├─ cwa.ts                    # CWA API adapter
+├─ model-wind.ts             # ECMWF 區域風場、3 小時快取與 DB 原子更新
 ├─ weather-store.ts          # 儲存、同步、查詢與 schema
 └─ types.ts                  # 共用型別
 public/
@@ -362,6 +377,7 @@ CWA_API_KEY=your-cwa-api-key
 CWA_DATASET_ID=F-C0032-001
 DATABASE_URL=postgresql://user:password@host/database?sslmode=require
 CRON_SECRET=replace-with-at-least-16-random-characters
+OPEN_METEO_API_KEY=
 ```
 
 如果只做本機 UI 開發，可以暫時不設定 `DATABASE_URL`；正式部署不可依賴記憶體暫存。
@@ -437,6 +453,7 @@ Vercel 的 Git 整合會為分支建立 Preview，Production branch 更新後建
 | `CWA_DATASET_ID` | 必要 | 否 | 預設 `F-C0032-001` |
 | `DATABASE_URL` | 正式儲存必要 | 是 | Neon PostgreSQL 連線 |
 | `CRON_SECRET` | 啟用排程必要 | 是 | 保護 `/api/cron` |
+| `OPEN_METEO_API_KEY` | 商用或高流量時必要 | 是 | Open-Meteo customer API；未設定時使用非商用 public API |
 
 環境變數修改只會套用到之後的新 deployment，因此變更後必須重新部署。參考[Vercel Environment Variables](https://vercel.com/docs/environment-variables)。
 
@@ -446,7 +463,7 @@ Vercel 的 Git 整合會為分支建立 Preview，Production branch 更新後建
 2. 將 Neon 產生的 Postgres 連線字串指定給本專案的 `DATABASE_URL`。
 3. 套用至 Production；需要 Preview DB 時另設 Preview 環境。
 4. 重新部署。
-5. 第一次呼叫同步 API 時，系統會自動建立 `weather_forecasts`、`sync_runs` 與索引。
+5. 第一次呼叫同步 API 時，系統會自動建立 `weather_forecasts`、`sync_runs`、`wind_fields`、同步租約與索引。
 6. 檢查 `/api/status` 的 `database.provider` 必須為 `neon`。
 
 ### 12.4 Cron

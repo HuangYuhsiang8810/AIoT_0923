@@ -29,6 +29,8 @@ button { border: 0; color: inherit; cursor: pointer; }
 .fallback-grid { position: absolute; inset: 0; opacity: .15; background-image: linear-gradient(rgba(255,255,255,.25) 1px, transparent 1px), linear-gradient(90deg, rgba(255,255,255,.25) 1px, transparent 1px); background-size: 54px 54px; transform: perspective(600px) rotateX(18deg) scale(1.4); }
 .map-tint { position: absolute; z-index: 2; inset: 0; pointer-events: none; opacity: .24; mix-blend-mode: color; transition: opacity .25s; background: radial-gradient(circle at 62% 44%, #ffcf5e 0 12%, transparent 35%), radial-gradient(circle at 81% 53%, #9fdb70 0 14%, transparent 34%), linear-gradient(110deg, #e7a24d 28%, #b5d873 74%); }
 .map-tint.hidden { opacity: 0; }
+body[data-layer="wind"] .map-tint { opacity: .18; mix-blend-mode: screen; background: radial-gradient(circle at 78% 28%, rgba(255,198,72,.35), transparent 20%), linear-gradient(115deg, rgba(31,102,170,.6), rgba(21,181,139,.52) 52%, rgba(105,209,112,.48)); }
+body[data-layer="wind"] .map-tint.hidden { opacity: 0; }
 #weather-effects { position: absolute; z-index: 3; inset: 0; overflow: hidden; pointer-events: none; transition: opacity .5s; }
 #weather-effects.hidden { opacity: 0; }
 #weather-effects canvas { position: absolute !important; inset: 0; }
@@ -97,6 +99,7 @@ h1 { margin: 0; font-size: 20px; letter-spacing: .03em; }
 #legend-values small { font-size: 9px; }
 .status-bar { left: 14px; bottom: 14px; min-height: 42px; padding: 8px 12px 8px 17px; display: flex; align-items: center; gap: 14px; font-size: 12px; }
 .status-bar span { color: #cbd3de; }
+.status-bar em { color: #8de7ff; font-size: 11px; font-style: normal; letter-spacing: .02em; }
 .status-bar button { padding: 6px 9px; border-radius: 5px; background: #364153; font-size: 11px; }
 .status-bar button:disabled { opacity: .55; cursor: wait; }
 .notice { position: absolute; z-index: 800; left: 50%; bottom: 82px; max-width: 520px; padding: 11px 17px; transform: translateX(-50%); border-radius: 7px; background: #182334; box-shadow: var(--shadow); color: #e8edf4; font-size: 12px; }
